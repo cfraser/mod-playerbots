@@ -15,33 +15,53 @@ namespace JumpTrajectory
 namespace
 {
 constexpr float EPSILON = 0.0001f;
-constexpr uint32 CONTACT_ITERATIONS = 8;  // halvings that place a contact along a chord
+constexpr uint32 CONTACT_ITERATIONS = 8;          // halvings that place a contact along a chord
+constexpr float WALKABLE_NORMAL_Z = 0.64278764f;  // cos 50 degrees: steeper facets are the client's walls and ceilings
+constexpr float SURFACE_PROBE_SPACING = 0.1f;     // between a ray and the rays beside it that find the surface it hit
+constexpr float TERRAIN_GRADIENT_SPACING = 0.25f;
+constexpr uint32 MAX_STALLS = 3;  // wall contacts in a row without progress before the body stops moving sideways
 
-enum class Contact : uint8
+enum class Surface : uint8
 {
     None,
     Wall,
     Ceiling
 };
 
-Point Lerp(Point const& from, Point const& to, float fraction)
+struct Contact
 {
-    return {from.x + (to.x - from.x) * fraction, from.y + (to.y - from.y) * fraction,
-            from.z + (to.z - from.z) * fraction};
+    Surface surface = Surface::None;
+    float fraction = 1.0f;  // of the chord, CONTACT_GAP short of the surface
+    Point normal;           // horizontal on a wall
+};
+
+struct Body
+{
+    float radius;
+    float lowerEdge;  // the box's bottom above the feet
+    float height;
+};
+
+Point operator+(Point const& a, Point const& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+Point operator-(Point const& a, Point const& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+Point operator*(Point const& a, float scale) { return {a.x * scale, a.y * scale, a.z * scale}; }
+float Dot(Point const& a, Point const& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+float Length(Point const& a) { return std::sqrt(Dot(a, a)); }
+Point Flat(Point const& a) { return {a.x, a.y, 0.0f}; }
+
+Point Cross(Point const& a, Point const& b)
+{
+    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
 }
 
-// How far along a chord a hit lies: by horizontal travel, or by height when the chord is vertical.
-float ChordFraction(Point const& from, Point const& to, Point const& hit)
+// Unit length, or zero when too short to have a direction.
+Point Direction(Point const& a)
 {
-    float const dx = to.x - from.x;
-    float const dy = to.y - from.y;
-    float const lengthSquared = dx * dx + dy * dy;
-    if (lengthSquared >= EPSILON)
-        return std::clamp(((hit.x - from.x) * dx + (hit.y - from.y) * dy) / lengthSquared, 0.0f, 1.0f);
-
-    float const dz = to.z - from.z;
-    return std::abs(dz) < EPSILON ? 0.0f : std::clamp((hit.z - from.z) / dz, 0.0f, 1.0f);
+    float const length = Length(a);
+    return length < EPSILON ? Point{} : a * (1.0f / length);
 }
+
+Point Lerp(Point const& from, Point const& to, float fraction) { return from + (to - from) * fraction; }
 
 // Where along a chord `touches` starts to hold, given that it holds at the end: the last fraction clear of it and the
 // first touching it.
@@ -73,6 +93,156 @@ float SwimHeight(CollisionProbe const& probe, Point const& end, float liquid, fl
     float const bed = probe.FloorZ(end.x, end.y, liquid, swimDepth);
     return bed <= NO_HEIGHT || liquid - bed > swimDepth ? liquid - swimDepth : NO_HEIGHT;
 }
+
+// The surface a ray hit, from where two rays beside it hit; false at an edge, where one of them misses on both sides.
+bool SurfaceNormal(CollisionProbe const& probe, Point const& from, Point const& to, Point const& hit, Point& normal)
+{
+    Point const direction = Direction(to - from);
+    Point side = Direction(Cross(direction, {0.0f, 0.0f, 1.0f}));
+    if (Length(side) < EPSILON)
+        side = {1.0f, 0.0f, 0.0f};
+
+    Point const offsets[2] = {side * SURFACE_PROBE_SPACING, Cross(side, direction) * SURFACE_PROBE_SPACING};
+    Point beside[2];
+    for (uint32 i = 0; i < 2; ++i)
+        if (!probe.RayHit(from + offsets[i], to + offsets[i], beside[i]) &&
+            !probe.RayHit(from - offsets[i], to - offsets[i], beside[i]))
+            return false;
+
+    normal = Direction(Cross(beside[0] - hit, beside[1] - hit));
+    if (Dot(normal, direction) > 0.0f)
+        normal = normal * -1.0f;
+
+    return Length(normal) > EPSILON;
+}
+
+// A wall or a ceiling, as the client tells them apart by the facet's slope. A floor met by the body's edge, such as a
+// ledge's top, stops it moving that way.
+Contact Classify(Point const& normal, Point const& forward)
+{
+    Contact contact;
+    if (normal.z < -WALKABLE_NORMAL_Z || Length(forward) < EPSILON)
+    {
+        contact.surface = Surface::Ceiling;
+        contact.normal = normal;
+        return contact;
+    }
+
+    contact.surface = Surface::Wall;
+    contact.normal = normal.z > WALKABLE_NORMAL_Z ? forward * -1.0f : Direction(Flat(normal));
+    return contact;
+}
+
+// Stops CONTACT_GAP short of the surface, measured along its normal: a steep fall comes that close to a wall too.
+float GapFraction(Point const& chord, Contact const& contact, float rayFraction)
+{
+    float const approach = -Dot(chord, contact.normal);
+    return approach > EPSILON ? std::max(0.0f, rayFraction - CONTACT_GAP / approach) : 0.0f;
+}
+
+// The first static or dynamic geometry the body's box meets along the chord: rays along its leading edges and through
+// its front, the head's middle while rising, and its front half after it turns, where a wall can already be.
+Contact RayContact(CollisionProbe const& probe, Body const& body, Point const& from, Point const& to, bool rising,
+                   bool turned)
+{
+    Point const chord = to - from;
+    Point const forward = Direction(Flat(chord));
+    bool const horizontal = Length(forward) > EPSILON;
+
+    Point offsets[6];
+    uint32 count = 0;
+    if (horizontal)
+    {
+        Point const front = forward * body.radius;
+        Point const side = Point{-forward.y, forward.x, 0.0f} * body.radius;
+        for (float const height : {body.lowerEdge, body.height})
+        {
+            offsets[count++] = front + side + Point{0.0f, 0.0f, height};
+            offsets[count++] = front - side + Point{0.0f, 0.0f, height};
+        }
+
+        offsets[count++] = front + Point{0.0f, 0.0f, body.height * 0.5f};  // a post narrower than the body
+    }
+
+    if (rising)
+        offsets[count++] = {0.0f, 0.0f, body.height};
+
+    Point rayFrom;
+    Point rayTo;
+    Point hit;
+    float rayFraction = 2.0f;
+    if (horizontal && turned)
+    {
+        Point const middle = from + Point{0.0f, 0.0f, body.height * 0.5f};
+        Point const front = middle + forward * body.radius;
+        if (probe.RayHit(middle, front, hit))
+        {
+            rayFrom = middle;
+            rayTo = front;
+            rayFraction = 0.0f;
+        }
+    }
+
+    float const length = Length(chord);
+    for (uint32 i = 0; i < count && rayFraction > 0.0f; ++i)
+    {
+        Point const start = from + offsets[i];
+        Point const end = to + offsets[i];
+        Point candidate;
+        if (!probe.RayHit(start, end, candidate))
+            continue;
+
+        float const fraction = length < EPSILON ? 0.0f : Length(candidate - start) / length;
+        if (fraction < rayFraction)
+        {
+            rayFraction = fraction;
+            rayFrom = start;
+            rayTo = end;
+            hit = candidate;
+        }
+    }
+
+    if (rayFraction > 1.0f)
+        return {};
+
+    Point normal;
+    if (!SurfaceNormal(probe, rayFrom, rayTo, hit, normal))
+        normal = horizontal ? forward * -1.0f : Point{0.0f, 0.0f, -1.0f};
+
+    Contact contact = Classify(normal, forward);
+    contact.fraction = GapFraction(chord, contact, rayFraction);
+    return contact;
+}
+
+// Terrain rising into the box's front, where it starts to: the heightmap is not in the rays.
+Contact TerrainContact(CollisionProbe const& probe, Body const& body, Point const& from, Point const& to)
+{
+    Point const forward = Direction(Flat(to - from));
+    auto frontAt = [&](float t) { return Lerp(from, to, t) + forward * body.radius; };
+    auto intoTerrain = [&](float t)
+    {
+        Point const front = frontAt(t);
+        float const terrain = probe.TerrainZ(front.x, front.y);
+        return terrain > NO_HEIGHT && terrain > std::max(from.z, front.z) + body.lowerEdge;
+    };
+    if (!intoTerrain(1.0f))
+        return {};
+
+    auto const [clear, touching] = FirstContact(intoTerrain);
+    Point const front = frontAt(touching);
+    float const spacing = TERRAIN_GRADIENT_SPACING;
+    float const east = probe.TerrainZ(front.x + spacing, front.y);
+    float const west = probe.TerrainZ(front.x - spacing, front.y);
+    float const north = probe.TerrainZ(front.x, front.y + spacing);
+    float const south = probe.TerrainZ(front.x, front.y - spacing);
+    Point normal = forward * -1.0f;
+    if (std::min({east, west, north, south}) > NO_HEIGHT)
+        normal = Direction({(west - east) / (2.0f * spacing), (south - north) / (2.0f * spacing), 1.0f});
+
+    Contact contact = Classify(normal, forward);
+    contact.fraction = clear;
+    return contact;
+}
 }  // namespace
 
 Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
@@ -80,6 +250,7 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
     Trajectory trajectory;
     float const halfHeight = launch.collisionHeight * 0.5f;
     float const terminal = launch.terminalVelocity;
+    Body const body{launch.collisionRadius, launch.collisionRadius * STEP_HEIGHT_PER_RADIUS, launch.collisionHeight};
 
     Point position = launch.position;
     float vx = launch.velocity.x;
@@ -103,13 +274,9 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         return trajectory;
     }
 
-    // Under the heightmap (caves, building interiors) the terrain is not a wall. Only horizontal travel meets walls.
-    bool underTerrain = true;
-    if (vx * vx + vy * vy > EPSILON)
-    {
-        float const takeoffTerrain = probe.TerrainZ(position.x, position.y);
-        underTerrain = takeoffTerrain > NO_HEIGHT && position.z < takeoffTerrain - TAKEOFF_SNAP;
-    }
+    // Under the heightmap (caves, building interiors) the terrain is not a wall.
+    float const takeoffTerrain = probe.TerrainZ(position.x, position.y);
+    bool const underTerrain = takeoffTerrain > NO_HEIGHT && position.z < takeoffTerrain - TAKEOFF_SNAP;
 
     Point segmentStart = position;
     float segmentStartVz = vz;
@@ -143,9 +310,47 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         return floor > NO_HEIGHT && point.z <= floor + launch.landingOffset;
     };
 
+    // The first thing the body meets on its way to `end`.
+    auto contactAlong = [&](Point const& end, bool rising, bool turned)
+    {
+        Contact contact = RayContact(probe, body, position, end, rising, turned);
+        if (underTerrain || Length(Flat(end - position)) < EPSILON)
+            return contact;
+
+        Contact const terrain = TerrainContact(probe, body, position, end);
+        if (terrain.surface != Surface::None &&
+            (contact.surface == Surface::None || terrain.fraction < contact.fraction))
+            contact = terrain;
+
+        return contact;
+    };
+
+    float const heldSpeedSquared = launch.velocity.x * launch.velocity.x + launch.velocity.y * launch.velocity.y;
+    bool keyHeld = launch.moveKeyHeld && heldSpeedSquared > EPSILON;
+    bool turned = true;  // the body's front is new: at takeoff, and after a wall turns it
+    uint32 stalls = 0;
     for (uint32 step = 0; step < MAX_STEPS; ++step)
     {
         bool const capped = vz <= -terminal + EPSILON;
+        auto arc = [&](float t, float speedX, float speedY)
+        {
+            return Point{position.x + speedX * t, position.y + speedY * t,
+                         capped ? position.z - terminal * t : position.z + vz * t - 0.5f * GRAVITY * t * t};
+        };
+
+        // The client gives a held key its speed and heading back once the wall no longer blocks them.
+        if (keyHeld && (vx != launch.velocity.x || vy != launch.velocity.y) &&
+            contactAlong(arc(Seconds(STEP_MS), launch.velocity.x, launch.velocity.y), false, true).surface !=
+                Surface::Wall)
+        {
+            closeSegment();
+            vx = launch.velocity.x;
+            vy = launch.velocity.y;
+            openSegment();
+            turned = true;
+            stalls = 0;
+        }
+
         bool const horizontal = vx * vx + vy * vy > EPSILON;
         float dt = Seconds(capped ? CAPPED_STEP_MS : STEP_MS);
         bool reachesTerminal = false;
@@ -168,53 +373,13 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
             }
         }
 
-        auto arcAt = [&](float t)
-        {
-            return Point{position.x + vx * t, position.y + vy * t,
-                         capped ? position.z - terminal * t : position.z + vz * t - 0.5f * GRAVITY * t * t};
-        };
+        auto arcAt = [&](float t) { return arc(t, vx, vy); };
         Point const end = arcAt(dt);
 
-        float fraction = 1.0f;
-        Contact contact = Contact::None;
-        Point hit;
-        if (horizontal)
-        {
-            // Terrain rising into the body is a wall where it starts to, not at the chord's start.
-            auto intoTerrain = [&](float t)
-            {
-                Point const point = arcAt(dt * t);
-                float const terrain = probe.TerrainZ(point.x, point.y);
-                return terrain > NO_HEIGHT && terrain > std::max(position.z, point.z) + halfHeight;
-            };
-            if (!underTerrain && intoTerrain(1.0f))
-            {
-                fraction = FirstContact(intoTerrain).first;
-                contact = Contact::Wall;
-            }
-            else if (probe.RayHit({position.x, position.y, position.z + halfHeight}, {end.x, end.y, end.z + halfHeight},
-                                  hit))
-            {
-                fraction = ChordFraction(position, end, hit);
-                contact = Contact::Wall;
-            }
-        }
-
-        Point const head{position.x, position.y, position.z + launch.collisionHeight};
-        Point const endHead{end.x, end.y, end.z + launch.collisionHeight};
-        // A fast rise can carry both rays into a ceiling in one chord; the head meets it first.
-        if (vz > 0.0f && probe.RayHit(head, endHead, hit))
-        {
-            float const ceiling = ChordFraction(head, endHead, hit);
-            if (contact == Contact::None || ceiling < fraction)
-            {
-                fraction = ceiling;
-                contact = Contact::Ceiling;
-            }
-        }
-
-        float chordTime = dt * fraction;
-        Point chordEnd = contact == Contact::None ? end : arcAt(chordTime);
+        Contact contact = horizontal || vz > 0.0f ? contactAlong(end, vz > 0.0f, turned) : Contact{};
+        turned = false;
+        float chordTime = dt * contact.fraction;
+        Point chordEnd = contact.surface == Surface::None ? end : arcAt(chordTime);
 
         auto finish = [&](Point const& landing, float time, Outcome outcome)
         {
@@ -272,16 +437,19 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
             auto const [clear, touching] = FirstContact([&](float t) { return onFloor(arcAt(chordTime * t)); });
             Point landing = arcAt(chordTime * touching);
             float const landingFloor = floorAt(landing) + launch.landingOffset;
-            if (!horizontal || landingFloor - landing.z <= launch.stepHeight)
+            if (!horizontal || landingFloor - landing.z <= body.lowerEdge)
             {
                 landing.z = landingFloor;
                 return finish(landing, chordTime * touching, Outcome::Landed);
             }
 
-            // A ledge above the step height meets the body's side, as a wall.
+            // A ledge above the step height meets the body's side, as a wall. No ray sees that side, so nothing would
+            // tell a held key when the ledge ends.
             chordTime *= clear;
             chordEnd = arcAt(chordTime);
-            contact = Contact::Wall;
+            contact.surface = Surface::Wall;
+            contact.normal = Direction({-vx, -vy, 0.0f});
+            keyHeld = false;
         }
         else if (chordEnd.z < launch.minZ)
         {
@@ -299,15 +467,29 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         segmentTime += chordTime;
         vz = capped ? -terminal : vz - GRAVITY * chordTime;
 
-        if (contact != Contact::None || reachesTerminal || reachesApex)
+        if (contact.surface != Surface::None || reachesTerminal || reachesApex)
         {
             closeSegment();
-            if (contact == Contact::Wall)
+            if (contact.surface == Surface::Wall)
             {
-                vx = 0.0f;
-                vy = 0.0f;
+                // The client keeps the motion along the wall and drops the part into it.
+                float const into = vx * contact.normal.x + vy * contact.normal.y;
+                if (into < 0.0f)
+                {
+                    vx -= into * contact.normal.x;
+                    vy -= into * contact.normal.y;
+                }
+
+                stalls = chordTime > 0.0f ? 0 : stalls + 1;
+                if (stalls >= MAX_STALLS || vx * vx + vy * vy <= EPSILON)
+                {
+                    vx = 0.0f;
+                    vy = 0.0f;
+                }
+
+                turned = true;
             }
-            else if (contact == Contact::Ceiling)
+            else if (contact.surface == Surface::Ceiling)
                 vz = std::min(vz, 0.0f);
             else
                 vz = reachesTerminal ? -terminal : 0.0f;

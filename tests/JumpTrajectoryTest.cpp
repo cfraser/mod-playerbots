@@ -4,8 +4,10 @@
  * or (at your option) any later version.
  */
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
+#include <utility>
 
 #include "JumpTrajectory.h"
 #include "gtest/gtest.h"
@@ -15,11 +17,12 @@ using namespace JumpTrajectory;
 namespace
 {
 constexpr float RUN_SPEED = 7.0f;
-constexpr float BACKOFF = 0.3f;
+constexpr float RADIUS = DEFAULT_COLLISION_RADIUS;
+constexpr uint32 RAYS_PER_CHORD = 5;  // along the body's four leading edges and through its front
 
-// Terrain from a height function, plus optional flat platforms, a wall plane at x = wallX, a ceiling plane and a
-// liquid surface. Platforms are found only within the search distance, like VMAP floors; terrain is found from
-// anywhere above it, like the heightmap.
+// Terrain from a height function, plus optional flat platforms, wall planes, boxes, a ceiling plane and a liquid
+// surface. Platforms are found only within the search distance, like VMAP floors; terrain is found from anywhere above
+// it, like the heightmap. Rays meet planes and boxes but not terrain or platforms, as in the core.
 struct FakeWorld : CollisionProbe
 {
     struct Platform
@@ -27,8 +30,22 @@ struct FakeWorld : CollisionProbe
         float minX, maxX, z;
     };
 
+    // The points p with Dot(normal, p) == offset.
+    struct Plane
+    {
+        Point normal;
+        float offset;
+    };
+
+    struct Box
+    {
+        Point min, max;
+    };
+
     std::function<float(float, float)> terrain = [](float, float) { return 0.0f; };
     std::vector<Platform> platforms;
+    std::vector<Plane> planes;
+    std::vector<Box> boxes;
     float wallX = 1e9f;
     float ceilingZ = 1e9f;
     float liquidZ = NO_HEIGHT;
@@ -36,6 +53,45 @@ struct FakeWorld : CollisionProbe
     float voidZ = -1e9f;
     float voidSlope = 0.0f;  // the map's lowest point rises this much per yard of x
     mutable uint32 rays = 0;
+
+    static float Along(Plane const& plane, Point const& point)
+    {
+        return plane.normal.x * point.x + plane.normal.y * point.y + plane.normal.z * point.z - plane.offset;
+    }
+
+    // Where the ray enters the box, or leaves it when it starts inside, as VMAP's two-sided triangles are hit.
+    static float BoxHit(Box const& box, Point const& from, Point const& to)
+    {
+        float const start[3] = {from.x, from.y, from.z};
+        float const delta[3] = {to.x - from.x, to.y - from.y, to.z - from.z};
+        float const low[3] = {box.min.x, box.min.y, box.min.z};
+        float const high[3] = {box.max.x, box.max.y, box.max.z};
+        float enter = -1e9f;
+        float leave = 1e9f;
+        for (uint32 axis = 0; axis < 3; ++axis)
+        {
+            if (std::abs(delta[axis]) < 1e-9f)
+            {
+                if (start[axis] < low[axis] || start[axis] > high[axis])
+                    return 2.0f;
+
+                continue;
+            }
+
+            float near = (low[axis] - start[axis]) / delta[axis];
+            float far = (high[axis] - start[axis]) / delta[axis];
+            if (near > far)
+                std::swap(near, far);
+
+            enter = std::max(enter, near);
+            leave = std::min(leave, far);
+        }
+
+        if (enter > leave || leave < 0.0f)
+            return 2.0f;
+
+        return enter >= 0.0f ? enter : leave;
+    }
 
     bool RayHit(Point const& from, Point const& to, Point& hit) const override
     {
@@ -45,12 +101,19 @@ struct FakeWorld : CollisionProbe
             best = (wallX - from.x) / (to.x - from.x);
         if ((from.z - ceilingZ) * (to.z - ceilingZ) < 0.0f)
             best = std::min(best, (ceilingZ - from.z) / (to.z - from.z));
+        for (Plane const& plane : planes)
+        {
+            float const a = Along(plane, from);
+            float const b = Along(plane, to);
+            if (a * b < 0.0f)
+                best = std::min(best, a / (a - b));
+        }
+        for (Box const& box : boxes)
+            best = std::min(best, BoxHit(box, from, to));
         if (best > 1.0f)
             return false;
 
-        float const length = std::hypot(to.x - from.x, to.y - from.y, to.z - from.z);
-        float const pulled = std::max(0.0f, best - BACKOFF / length);
-        hit = {from.x + (to.x - from.x) * pulled, from.y + (to.y - from.y) * pulled, from.z + (to.z - from.z) * pulled};
+        hit = {from.x + (to.x - from.x) * best, from.y + (to.y - from.y) * best, from.z + (to.z - from.z) * best};
         return true;
     }
 
@@ -143,8 +206,9 @@ TEST(JumpTrajectory, WallStopsHorizontalTravelThenFallsStraightDown)
     ASSERT_EQ(trajectory.segments.size(), 2u);
     Segment const& fall = trajectory.segments[1];
     EXPECT_FLOAT_EQ(fall.start.x, fall.end.x);
-    EXPECT_LT(trajectory.landing.x, 4.0f);
-    EXPECT_GT(trajectory.landing.x, 4.0f - 2.0f * BACKOFF);
+    // The body's front stops short of the wall.
+    EXPECT_LT(trajectory.landing.x, 4.0f - RADIUS);
+    EXPECT_GT(trajectory.landing.x, 4.0f - RADIUS - 2.0f * CONTACT_GAP);
     EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
 }
 
@@ -387,7 +451,7 @@ TEST(JumpTrajectory, SlowFallGlidesFarWithFewRays)
     ASSERT_EQ(trajectory.outcome, Outcome::Landed);
     EXPECT_GT(trajectory.landing.x, 40.0f);
     EXPECT_EQ(trajectory.segments.back().kind, SegmentKind::Linear);
-    EXPECT_LT(world.rays, 60u);
+    EXPECT_LT(world.rays, 32u * RAYS_PER_CHORD);
 }
 
 TEST(JumpTrajectory, HoverLandsAboveTheFloor)
@@ -442,7 +506,7 @@ TEST(JumpTrajectory, CeilingStopsAStandingJump)
     ASSERT_EQ(trajectory.segments.size(), 2u);
     float const headAtStop = trajectory.segments[0].end.z + launch.collisionHeight;
     EXPECT_LT(headAtStop, world.ceilingZ);
-    EXPECT_GT(headAtStop, world.ceilingZ - 2.0f * BACKOFF);
+    EXPECT_GT(headAtStop, world.ceilingZ - 2.0f * CONTACT_GAP);
     EXPECT_FLOAT_EQ(trajectory.segments[1].startVz, 0.0f);
     EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
 }
@@ -474,8 +538,8 @@ TEST(JumpTrajectory, CliffStopsAFastFallWhereItRises)
     Trajectory trajectory = Sweep(launch, world);
 
     ASSERT_EQ(trajectory.outcome, Outcome::Landed);
-    EXPECT_LT(trajectory.landing.x, 5.0f);
-    EXPECT_GT(trajectory.landing.x, 4.95f);
+    EXPECT_LT(trajectory.landing.x, 5.0f - RADIUS);
+    EXPECT_GT(trajectory.landing.x, 5.0f - RADIUS - 0.05f);
     EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
 }
 
@@ -514,6 +578,148 @@ TEST(JumpTrajectory, WaterWalkerJumpsOffTheSurface)
     ASSERT_EQ(trajectory.outcome, Outcome::Landed);
     EXPECT_TRUE(trajectory.segments.empty());
     EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
+}
+
+// A walkable hill is landed on where the arc meets it, however fast the body comes in.
+TEST(JumpTrajectory, FastArcLandsOnAWalkableHill)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return std::max(0.0f, x - 3.0f); };  // 45 degrees
+    Launch launch;
+    launch.velocity = {20.0f, 0.0f, 3.0f};
+    Trajectory trajectory = Sweep(launch, world);
+
+    // 3t - g t^2 / 2 = 20t - 3
+    float const time = (-17.0f + std::sqrt(17.0f * 17.0f + 4.0f * 0.5f * GRAVITY * 3.0f)) / GRAVITY;
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_NEAR(trajectory.landing.x, 20.0f * time, 0.05f);
+    EXPECT_NEAR(trajectory.landing.z, 20.0f * time - 3.0f, 0.05f);
+}
+
+// The body's top meets an overhang that its middle passes under.
+TEST(JumpTrajectory, OverhangAtHeadHeightIsAWall)
+{
+    FakeWorld world;
+    world.boxes.push_back({{3.0f, -10.0f, 3.0f}, {10.0f, 10.0f, 6.0f}});
+    Trajectory trajectory = Sweep(RunningJump({0.0f, 0.0f, 0.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(trajectory.landing.x, 3.0f - RADIUS);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
+}
+
+// A steep fall stops with the body's side at the wall, not its middle.
+TEST(JumpTrajectory, SteepFallStopsBesideTheWall)
+{
+    FakeWorld world;
+    world.wallX = 1.0f;
+    Launch launch;
+    launch.position = {0.0f, 0.0f, 50.0f};
+    launch.velocity.x = 0.5f;
+    Trajectory trajectory = Sweep(launch, world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(trajectory.landing.x, 1.0f - RADIUS);
+    EXPECT_GT(trajectory.landing.x, 1.0f - RADIUS - 2.0f * CONTACT_GAP);
+}
+
+// The client keeps the motion along the wall and drops the part into it.
+TEST(JumpTrajectory, SlidesAlongAnAngledWall)
+{
+    FakeWorld world;
+    float const half = std::sqrt(0.5f);
+    world.planes.push_back({{half, -half, 0.0f}, 3.0f * half});  // x - y = 3
+    Launch launch;
+    launch.velocity = {10.0f, 0.0f, 5.0f};
+    Trajectory trajectory = Sweep(launch, world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    ASSERT_EQ(trajectory.segments.size(), 2u);
+    Segment const& slide = trajectory.segments[1];
+    float const seconds = slide.durationMs / 1000.0f;
+    EXPECT_NEAR((slide.end.x - slide.start.x) / seconds, 5.0f, 0.05f);
+    EXPECT_NEAR((slide.end.y - slide.start.y) / seconds, 5.0f, 0.05f);
+    EXPECT_LT(trajectory.landing.x - trajectory.landing.y, 3.0f);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
+}
+
+TEST(JumpTrajectory, SlidesAlongACliff)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float y) { return x - y < 3.0f ? 0.0f : 300.0f; };
+    Launch launch;
+    launch.position = {0.0f, 0.0f, 1.0f};
+    launch.velocity = {10.0f, 0.0f, 5.0f};
+    Trajectory trajectory = Sweep(launch, world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_GT(trajectory.landing.y, 1.0f);
+    EXPECT_LT(trajectory.landing.x - trajectory.landing.y, 3.0f);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
+}
+
+TEST(JumpTrajectory, CornerStopsTheSlide)
+{
+    FakeWorld world;
+    world.wallX = 3.0f;
+    world.planes.push_back({{0.0f, 1.0f, 0.0f}, 1.0f});  // y = 1
+    Launch launch;
+    launch.velocity = {10.0f, 5.0f, 5.0f};
+    Trajectory trajectory = Sweep(launch, world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(trajectory.landing.x, 3.0f - RADIUS);
+    EXPECT_LT(trajectory.landing.y, 1.0f - RADIUS);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 0.0f);
+}
+
+// Past the end of the wall, a held key gets the launch's speed and heading back; a knockback keeps the slide.
+TEST(JumpTrajectory, HeldKeyTurnsBackPastTheWall)
+{
+    FakeWorld world;
+    world.boxes.push_back({{2.0f, -10.0f, -1.0f}, {3.0f, 1.0f, 10.0f}});
+    Launch launch = RunningJump({0.0f, 0.0f, 0.0f});
+    launch.velocity.x = 6.0f;
+    launch.velocity.y = 3.0f;
+    Trajectory const slid = Sweep(launch, world);
+
+    ASSERT_EQ(slid.outcome, Outcome::Landed);
+    EXPECT_LT(slid.landing.x, 2.0f - RADIUS);
+    EXPECT_GT(slid.landing.y, 2.0f);
+
+    launch.moveKeyHeld = true;
+    Trajectory const held = Sweep(launch, world);
+
+    ASSERT_EQ(held.outcome, Outcome::Landed);
+    EXPECT_GT(held.landing.x, 3.0f);
+    EXPECT_GT(held.landing.y, 1.0f + RADIUS);
+    ASSERT_GE(held.segments.size(), 3u);
+    Segment const& last = held.segments.back();
+    EXPECT_NEAR((last.end.x - last.start.x) / (last.end.y - last.start.y), 2.0f, 0.01f);
+}
+
+TEST(JumpTrajectory, PostNarrowerThanTheBodyIsAWall)
+{
+    FakeWorld world;
+    world.boxes.push_back({{3.0f, -0.05f, -1.0f}, {3.1f, 0.05f, 10.0f}});
+    Trajectory trajectory = Sweep(RunningJump({0.0f, 0.0f, 0.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(trajectory.landing.x, 3.0f - RADIUS);
+}
+
+// A bot thrown with its front already against a wall does not pass through it.
+TEST(JumpTrajectory, LaunchAgainstAWallStaysOnItsSide)
+{
+    FakeWorld world;
+    world.wallX = 0.2f;
+    Launch launch;
+    launch.position = {0.0f, 0.0f, 5.0f};
+    launch.velocity.x = RUN_SPEED;
+    Trajectory trajectory = Sweep(launch, world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(trajectory.landing.x, 0.2f);
 }
 
 TEST(JumpTrajectorySegment, AmplitudeAndVelocityMatchTheSplineMath)

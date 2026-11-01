@@ -33,10 +33,11 @@ constexpr float SWIM_DEPTH = 0.75f;   // share of collision height; shallower wa
 // A void fall ends at least this far below the map's lowest point: the core counts only a body strictly below it as out
 // of bounds.
 constexpr float VOID_DEPTH = 1.0f;
-// The client's body starts this many collision radii above the feet: a ledge lower than that is landed on, a taller one
-// is a wall.
+// The client's body is a box from this many collision radii above the feet up to its collision height, over a pyramid
+// down to the feet: a ledge lower than the box is landed on, a taller one is a wall.
 constexpr float STEP_HEIGHT_PER_RADIUS = 1.849399f;
 constexpr float DEFAULT_COLLISION_RADIUS = 0.33333334f;
+constexpr float CONTACT_GAP = 0.05f;  // what a stop leaves between the body and what it hit
 
 struct Point
 {
@@ -77,8 +78,11 @@ struct Launch
     float collisionHeight = 2.03f;
     float landingOffset = 0.0f;  // hover height
     float minZ = NO_HEIGHT;      // refuse a trajectory that drops below this
-    float stepHeight = DEFAULT_COLLISION_RADIUS * STEP_HEIGHT_PER_RADIUS;
+    float collisionRadius = DEFAULT_COLLISION_RADIUS;
     bool waterWalking = false;  // liquid surfaces are floors, and landing on one deals fall damage
+    // A client holding a movement key gets the launch's horizontal velocity back once a wall it slid along no longer
+    // blocks it; without one it keeps what the slide left.
+    bool moveKeyHeld = false;
 };
 
 class CollisionProbe
@@ -86,7 +90,7 @@ class CollisionProbe
 public:
     virtual ~CollisionProbe() = default;
 
-    // First hit of static or dynamic geometry from `from` toward `to`, pulled back a little toward `from`.
+    // The exact first hit of static or dynamic geometry from `from` toward `to`; triangles are hit from either side.
     virtual bool RayHit(Point const& from, Point const& to, Point& hit) const = 0;
     // Heightmap only, NO_HEIGHT where there is none.
     virtual float TerrainZ(float x, float y) const = 0;

@@ -39,7 +39,6 @@ constexpr float SURVIVAL_MARGIN = 0.05f;     // share of max health a drop down 
 // Player::HandleFall: the damage share of max health is FALL_DMG_SLOPE * height + FALL_DMG_INTERCEPT.
 constexpr float FALL_DMG_SLOPE = 0.018f;
 constexpr float FALL_DMG_INTERCEPT = -0.2426f;
-constexpr float WALL_BACKOFF = 0.3f;
 constexpr float FACING_TOLERANCE = 0.2f;  // a smaller turn is not worth relaunching the arc and broadcasting it
 constexpr float ARRIVAL_TOLERANCE = 0.5f;
 constexpr float GROUND_CONTACT = 1.0f;
@@ -67,14 +66,14 @@ public:
         float y;
         float z;
         if (collision.GetStaticTree().GetObjectHitPos(from.x, from.y, from.z, nearest.x, nearest.y, nearest.z, x, y, z,
-                                                      -WALL_BACKOFF))
+                                                      0.0f))
         {
             nearest = {x, y, z};
             found = true;
         }
 
         if (collision.GetDynamicTree().GetObjectHitPos(_phaseMask, from.x, from.y, from.z, nearest.x, nearest.y,
-                                                       nearest.z, x, y, z, -WALL_BACKOFF))
+                                                       nearest.z, x, y, z, 0.0f))
         {
             nearest = {x, y, z};
             found = true;
@@ -151,7 +150,8 @@ Point AirborneController::BotPoint() const
     return {_bot->GetPositionX(), _bot->GetPositionY(), _bot->GetPositionZ()};
 }
 
-Trajectory AirborneController::SweepFrom(Point const& position, Point const& velocity, float minZ, float maxWalk) const
+Trajectory AirborneController::SweepFrom(Point const& position, Point const& velocity, float minZ, bool moveKeyHeld,
+                                         float maxWalk) const
 {
     Launch launch;
     launch.position = position;
@@ -161,7 +161,8 @@ Trajectory AirborneController::SweepFrom(Point const& position, Point const& vel
     launch.landingOffset = _bot->GetHoverHeight();
     launch.minZ = minZ;
     // The bounding radius is the model's collision radius the client uses.
-    launch.stepHeight = _bot->GetBoundaryRadius() * STEP_HEIGHT_PER_RADIUS;
+    launch.collisionRadius = _bot->GetBoundaryRadius();
+    launch.moveKeyHeld = moveKeyHeld;
     // A launch stops a client swimming, so the aura alone decides.
     launch.waterWalking = _bot->HasWaterWalkAura();
     MapProbe const probe(_bot->GetMap(), _bot->GetPhaseMask(), launch.collisionHeight);
@@ -195,7 +196,7 @@ bool AirborneController::Jump(float heading, float speedXY)
     Point const takeoff = BotPoint();
     float const minZ = takeoff.z - (IsFallHarmless() ? NO_DROP_CAP : DELIBERATE_DROP_CAP);
     Point const velocity{std::cos(heading) * speedXY, std::sin(heading) * speedXY, JUMP_VELOCITY};
-    Trajectory trajectory = SweepFrom(takeoff, velocity, minZ);
+    Trajectory trajectory = SweepFrom(takeoff, velocity, minZ, true);
     if (!IsSafeLanding(trajectory))
         return false;
 
@@ -224,7 +225,7 @@ bool AirborneController::DropDownTo(Unit const* target)
     float const speedXY = _bot->GetSpeed(MOVE_RUN);
     Point const velocity{std::cos(heading) * speedXY, std::sin(heading) * speedXY, 0.0f};
     float const maxDrop = SurvivableDrop();
-    Trajectory trajectory = SweepFrom(start, velocity, start.z - maxDrop, DROP_DOWN_WALK);
+    Trajectory trajectory = SweepFrom(start, velocity, start.z - maxDrop, true, DROP_DOWN_WALK);
     Point const& landing = trajectory.landing;
     // Fall damage counts from the edge, which the walk may climb to, and a sweep step can land past its depth limit.
     if (!IsSafeLanding(trajectory) ||
@@ -261,7 +262,7 @@ void AirborneController::Knockback(float vcos, float vsin, float speedXY, float 
         _bot->StopMoving();
 
     Point const start = BotPoint();
-    Trajectory trajectory = SweepFrom(start, {vcos * speedXY, vsin * speedXY, speedZ}, start.z - NO_DROP_CAP);
+    Trajectory trajectory = SweepFrom(start, {vcos * speedXY, vsin * speedXY, speedZ}, start.z - NO_DROP_CAP, false);
     if (sPlayerbotAIConfig.KnockbackEdgeProtection &&
         (!IsSafeLanding(trajectory) || trajectory.landing.z < start.z - DELIBERATE_DROP_CAP))
         trajectory = ProtectedKnockback(vcos, vsin, speedXY, speedZ);
@@ -339,7 +340,7 @@ void AirborneController::StartFall()
     if (!CanLeaveGround() || IsSwimming() || _bot->Unit::IsInWater())
         return;
 
-    Trajectory trajectory = SweepFrom(start, {}, start.z - NO_DROP_CAP);
+    Trajectory trajectory = SweepFrom(start, {}, start.z - NO_DROP_CAP, false);
     if (trajectory.Ends())
         Begin(std::move(trajectory), start.z);
 }
@@ -584,7 +585,7 @@ void AirborneController::Resweep()
     Point const velocity = CurrentVelocity();
     Interrupt(_bot->GetOrientation());
     _bot->GetMotionMaster()->Clear();
-    Trajectory trajectory = SweepFrom(position, velocity, position.z - NO_DROP_CAP);
+    Trajectory trajectory = SweepFrom(position, velocity, position.z - NO_DROP_CAP, false);
     if (!trajectory.Ends())
     {
         Settle();

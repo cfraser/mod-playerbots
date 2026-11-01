@@ -57,8 +57,9 @@ private:
     // The deepest landing below the takeoff the bot survives with some health to spare.
     float SurvivableDrop() const;
     Point BotPoint() const;
-    // A walk of up to maxWalk to the edge first when set.
-    Trajectory SweepFrom(Point const& position, Point const& velocity, float minZ, float maxWalk = 0.0f) const;
+    // A walk of up to maxWalk to the edge first when set. moveKeyHeld as a client running or walking holds one.
+    Trajectory SweepFrom(Point const& position, Point const& velocity, float minZ, bool moveKeyHeld,
+                         float maxWalk = 0.0f) const;
     bool IsOnNavMesh(Point const& point) const;
     // Lands, and on the walkable area unless in liquid.
     bool IsSafeLanding(Trajectory const& trajectory) const;
