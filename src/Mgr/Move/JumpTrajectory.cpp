@@ -17,15 +17,25 @@ namespace
 constexpr float EPSILON = 0.0001f;
 constexpr uint32 CONTACT_ITERATIONS = 8;          // halvings that place a contact along a chord
 constexpr float WALKABLE_NORMAL_Z = 0.64278764f;  // cos 50 degrees: steeper facets are the client's walls and ceilings
-constexpr float SURFACE_PROBE_SPACING = 0.1f;     // between a ray and the rays beside it that find the surface it hit
+constexpr float SURFACE_PROBE_SPACING = 0.1f;  // between a ray or floor sample and those beside it that find its slope
 constexpr float TERRAIN_GRADIENT_SPACING = 0.25f;
+constexpr float FLOOR_SAMPLE_REACH = 1.0f;  // a floor sample further above or below is another surface, as past an edge
 constexpr uint32 MAX_STALLS = 3;  // wall contacts in a row without progress before the body stops moving sideways
+constexpr float SLIDE_MIN_NORMAL_Z = 0.17364818f;  // cos 80 degrees: a steeper facet is a wall to fall beside
+// A slide keeps to its floor within this: the floor's slope is sampled, so the body drifts off it where it bends.
+constexpr float SLIDE_TOLERANCE = 0.2f;
+// The client stops a fall that a slope pushes further sideways than this per yard dropped, as into a shallow crease
+// with a wall.
+constexpr float SLIDE_MAX_PUSH = 1.1866661f;
+// A slide's sideways speed grows with its fall, which a segment cannot follow: chords merge into segments this long.
+constexpr uint32 SLIDE_SEGMENT_MS = 200;
 
 enum class Surface : uint8
 {
     None,
     Wall,
-    Ceiling
+    Ceiling,
+    Slope  // too steep to stand on, met falling: the body slides down it
 };
 
 struct Contact
@@ -41,6 +51,9 @@ struct Body
     float lowerEdge;  // the box's bottom above the feet
     float height;
 };
+
+// Where rays through the body's middle go: half its height, or its bottom when a slope raises that.
+float Middle(Body const& body) { return std::max(body.height * 0.5f, body.lowerEdge); }
 
 Point operator+(Point const& a, Point const& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 Point operator-(Point const& a, Point const& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
@@ -116,14 +129,57 @@ bool SurfaceNormal(CollisionProbe const& probe, Point const& from, Point const& 
     return Length(normal) > EPSILON;
 }
 
-// A wall or a ceiling, as the client tells them apart by the facet's slope. A floor met by the body's edge, such as a
-// ledge's top, stops it moving that way.
-Contact Classify(Point const& normal, Point const& forward)
+// The floor's normal at `at`, a point on it, from floor heights beside it; false when neither side of an axis is in
+// reach. Each axis takes the side nearer in height, so a ledge's edge or a step's nose reads as flat.
+bool FloorNormal(CollisionProbe const& probe, Point const& at, Point& normal)
 {
+    float const spacing = SURFACE_PROBE_SPACING;
+    auto gradient = [&](float dx, float dy, float& slope)
+    {
+        bool found = false;
+        for (float const sign : {1.0f, -1.0f})
+        {
+            float const floor =
+                probe.FloorZ(at.x + sign * dx, at.y + sign * dy, at.z + FLOOR_SAMPLE_REACH, 2.0f * FLOOR_SAMPLE_REACH);
+            if (floor <= NO_HEIGHT || std::abs(floor - at.z) > FLOOR_SAMPLE_REACH)
+                continue;
+
+            float const candidate = sign * (floor - at.z) / spacing;
+            if (!found || std::abs(candidate) < std::abs(slope))
+                slope = candidate;
+
+            found = true;
+        }
+
+        return found;
+    };
+
+    float slopeX = 0.0f;
+    float slopeY = 0.0f;
+    if (!gradient(spacing, 0.0f, slopeX) || !gradient(0.0f, spacing, slopeY))
+        return false;
+
+    normal = Direction({-slopeX, -slopeY, 1.0f});
+    return true;
+}
+
+// A wall, a ceiling or a slope, as the client tells them apart by the facet's slope. A floor met by the body's edge,
+// such as a ledge's top, stops it moving that way.
+Contact Classify(Point const& normal, Point const& chord)
+{
+    Point const forward = Direction(Flat(chord));
     Contact contact;
     if (normal.z < -WALKABLE_NORMAL_Z || Length(forward) < EPSILON)
     {
         contact.surface = Surface::Ceiling;
+        contact.normal = normal;
+        return contact;
+    }
+
+    // Steeper than the box's pyramid, a slope meets its lower edge before its feet.
+    if (chord.z < 0.0f && normal.z > SLIDE_MIN_NORMAL_Z && normal.z <= WALKABLE_NORMAL_Z)
+    {
+        contact.surface = Surface::Slope;
         contact.normal = normal;
         return contact;
     }
@@ -133,7 +189,8 @@ Contact Classify(Point const& normal, Point const& forward)
     return contact;
 }
 
-// Stops CONTACT_GAP short of the surface, measured along its normal: a steep fall comes that close to a wall too.
+// Stops CONTACT_GAP short of the surface, measured along its normal: a steep fall comes that close to a wall too, and a
+// fall onto a slope that close to the slope.
 float GapFraction(Point const& chord, Contact const& contact, float rayFraction)
 {
     float const approach = -Dot(chord, contact.normal);
@@ -161,7 +218,7 @@ Contact RayContact(CollisionProbe const& probe, Body const& body, Point const& f
             offsets[count++] = front - side + Point{0.0f, 0.0f, height};
         }
 
-        offsets[count++] = front + Point{0.0f, 0.0f, body.height * 0.5f};  // a post narrower than the body
+        offsets[count++] = front + Point{0.0f, 0.0f, Middle(body)};  // a post narrower than the body
     }
 
     if (rising)
@@ -173,7 +230,7 @@ Contact RayContact(CollisionProbe const& probe, Body const& body, Point const& f
     float rayFraction = 2.0f;
     if (horizontal && turned)
     {
-        Point const middle = from + Point{0.0f, 0.0f, body.height * 0.5f};
+        Point const middle = from + Point{0.0f, 0.0f, Middle(body)};
         Point const front = middle + forward * body.radius;
         if (probe.RayHit(middle, front, hit))
         {
@@ -209,7 +266,7 @@ Contact RayContact(CollisionProbe const& probe, Body const& body, Point const& f
     if (!SurfaceNormal(probe, rayFrom, rayTo, hit, normal))
         normal = horizontal ? forward * -1.0f : Point{0.0f, 0.0f, -1.0f};
 
-    Contact contact = Classify(normal, forward);
+    Contact contact = Classify(normal, chord);
     contact.fraction = GapFraction(chord, contact, rayFraction);
     return contact;
 }
@@ -217,7 +274,8 @@ Contact RayContact(CollisionProbe const& probe, Body const& body, Point const& f
 // Terrain rising into the box's front, where it starts to: the heightmap is not in the rays.
 Contact TerrainContact(CollisionProbe const& probe, Body const& body, Point const& from, Point const& to)
 {
-    Point const forward = Direction(Flat(to - from));
+    Point const chord = to - from;
+    Point const forward = Direction(Flat(chord));
     auto frontAt = [&](float t) { return Lerp(from, to, t) + forward * body.radius; };
     auto intoTerrain = [&](float t)
     {
@@ -239,7 +297,7 @@ Contact TerrainContact(CollisionProbe const& probe, Body const& body, Point cons
     if (std::min({east, west, north, south}) > NO_HEIGHT)
         normal = Direction({(west - east) / (2.0f * spacing), (south - north) / (2.0f * spacing), 1.0f});
 
-    Contact contact = Classify(normal, forward);
+    Contact contact = Classify(normal, chord);
     contact.fraction = clear;
     return contact;
 }
@@ -250,7 +308,9 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
     Trajectory trajectory;
     float const halfHeight = launch.collisionHeight * 0.5f;
     float const terminal = launch.terminalVelocity;
-    Body const body{launch.collisionRadius, launch.collisionRadius * STEP_HEIGHT_PER_RADIUS, launch.collisionHeight};
+    Body const standing{launch.collisionRadius, launch.collisionRadius * STEP_HEIGHT_PER_RADIUS,
+                        launch.collisionHeight};
+    Body body = standing;
 
     Point position = launch.position;
     float vx = launch.velocity.x;
@@ -295,8 +355,18 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         uint32 const durationMs = Milliseconds(segmentTime);
         if (durationMs > 0)
             trajectory.segments.push_back({segmentStart, position, durationMs, segmentStartVz, segmentKind});
+
+        segmentTime = 0.0f;
     };
     openSegment();
+
+    // Sliding down a floor too steep to stand on: the client lets the body fall as freely as in the air, and pushes it
+    // out sideways to stay on the floor.
+    bool sliding = false;
+    bool hovering = false;  // lifted off a slope that steepens, the body falls back onto it unpushed
+    Point slopeNormal;
+    Point slide;      // the sideways push per yard dropped
+    Point slideWall;  // the flat normal of a wall the slope pushes the body along, zero when none
 
     // The floor under a point of the chord, searched from the body's middle at the chord's higher end.
     auto floorAt = [&](Point const& point)
@@ -304,10 +374,55 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         float const searchFrom = std::max(position.z, point.z) + halfHeight;
         return probe.FloorZ(point.x, point.y, searchFrom, searchFrom - point.z + FLOOR_SEARCH_MARGIN);
     };
-    auto onFloor = [&](Point const& point)
+    // Sunk to the floor, or for a slide SLIDE_TOLERANCE into it. The heightmap counts even above where the floor is
+    // searched from, as where a slope bends up or a ridge is too narrow for the body's front to meet.
+    auto sunkAt = [&](Point const& point, float floor)
     {
-        float const floor = floorAt(point);
-        return floor > NO_HEIGHT && point.z <= floor + launch.landingOffset;
+        float const tolerance = sliding && !hovering ? SLIDE_TOLERANCE : 0.0f;
+        if (floor > NO_HEIGHT && point.z <= floor + launch.landingOffset - tolerance)
+            return true;
+
+        return !underTerrain && probe.TerrainZ(point.x, point.y) > point.z + tolerance;
+    };
+    auto onFloor = [&](Point const& point) { return sunkAt(point, floorAt(point)); };
+    // Too steep to stand on by the client's limit, with the floor's normal; a slope that cannot be sampled is stood on.
+    auto steepFloor = [&](Point const& at, Point& normal)
+    { return FloorNormal(probe, at, normal) && normal.z <= WALKABLE_NORMAL_Z; };
+    // Slides down a floor with this normal; false when a wall pins the body there.
+    auto slideDown = [&](Point const& normal)
+    {
+        slopeNormal = normal;
+        Point const flat = Flat(normal);
+        Point const away = Direction(flat);
+        Point direction = away;
+        float fallLine = Length(flat);
+        if (Dot(away, slideWall) < 0.0f)
+        {
+            // Against a wall it slides along the crease, pushed further the shallower the crease falls.
+            direction = {-slideWall.y, slideWall.x, 0.0f};
+            if (Dot(direction, away) < 0.0f)
+                direction = direction * -1.0f;
+
+            fallLine = Dot(flat, direction);
+        }
+
+        if (fallLine * SLIDE_MAX_PUSH < normal.z)
+            return false;
+
+        slide = direction * (normal.z / fallLine);
+
+        // Motion into the slope goes as into a wall.
+        float const into = vx * away.x + vy * away.y;
+        if (into < 0.0f)
+        {
+            vx -= into * away.x;
+            vy -= into * away.y;
+        }
+
+        // The box rides above the slope: no ray should start inside it, as one at a corner uphill would.
+        float const rise = standing.radius * std::sqrt(2.0f) * Length(flat) / normal.z + CONTACT_GAP;
+        body.lowerEdge = std::min(standing.height, std::max(standing.lowerEdge, rise));
+        return true;
     };
 
     // The first thing the body meets on its way to `end`.
@@ -339,7 +454,7 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         };
 
         // The client gives a held key its speed and heading back once the wall no longer blocks them.
-        if (keyHeld && (vx != launch.velocity.x || vy != launch.velocity.y) &&
+        if (keyHeld && !sliding && (vx != launch.velocity.x || vy != launch.velocity.y) &&
             contactAlong(arc(Seconds(STEP_MS), launch.velocity.x, launch.velocity.y), false, true).surface !=
                 Surface::Wall)
         {
@@ -352,7 +467,7 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         }
 
         bool const horizontal = vx * vx + vy * vy > EPSILON;
-        float dt = Seconds(capped ? CAPPED_STEP_MS : STEP_MS);
+        float dt = Seconds(capped && !sliding ? CAPPED_STEP_MS : STEP_MS);
         bool reachesTerminal = false;
         bool reachesApex = false;
         if (!capped)
@@ -373,10 +488,15 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
             }
         }
 
-        auto arcAt = [&](float t) { return arc(t, vx, vy); };
+        auto arcAt = [&](float t)
+        {
+            Point const point = arc(t, vx, vy);
+            return sliding && !hovering ? point + slide * std::max(0.0f, position.z - point.z) : point;
+        };
         Point const end = arcAt(dt);
+        bool const moves = Length(Flat(end - position)) > EPSILON;
 
-        Contact contact = horizontal || vz > 0.0f ? contactAlong(end, vz > 0.0f, turned) : Contact{};
+        Contact contact = moves || vz > 0.0f ? contactAlong(end, vz > 0.0f, turned) : Contact{};
         turned = false;
         float chordTime = dt * contact.fraction;
         Point chordEnd = contact.surface == Surface::None ? end : arcAt(chordTime);
@@ -405,7 +525,7 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
         };
 
         float const floor = floorAt(chordEnd);
-        bool const reachesFloor = floor > NO_HEIGHT && chordEnd.z <= floor + launch.landingOffset;
+        bool const reachesFloor = sunkAt(chordEnd, floor);
 
         // A long chord can pass through liquid and end below its bed, so ask at the floor: the core finds no liquid
         // below the bed.
@@ -432,24 +552,37 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
             }
         }
 
+        bool touchesSlope = false;
+        bool leavesSlope = false;
+        Point slope;
         if (reachesFloor)
         {
             auto const [clear, touching] = FirstContact([&](float t) { return onFloor(arcAt(chordTime * t)); });
             Point landing = arcAt(chordTime * touching);
             float const landingFloor = floorAt(landing) + launch.landingOffset;
-            if (!horizontal || landingFloor - landing.z <= body.lowerEdge)
+            if (!moves || landingFloor - landing.z <= standing.lowerEdge)
             {
                 landing.z = landingFloor;
-                return finish(landing, chordTime * touching, Outcome::Landed);
-            }
+                if (!steepFloor({landing.x, landing.y, landingFloor - launch.landingOffset}, slope))
+                    return finish(landing, chordTime * touching, Outcome::Landed);
 
-            // A ledge above the step height meets the body's side, as a wall. No ray sees that side, so nothing would
-            // tell a held key when the ledge ends.
-            chordTime *= clear;
-            chordEnd = arcAt(chordTime);
-            contact.surface = Surface::Wall;
-            contact.normal = Direction({-vx, -vy, 0.0f});
-            keyHeld = false;
+                chordTime *= touching;
+                chordEnd = landing;
+                contact = {};
+                touchesSlope = true;
+                reachesTerminal = false;
+                reachesApex = false;
+            }
+            else
+            {
+                // A ledge above the step height meets the body's side, as a wall. No ray sees that side, so nothing
+                // would tell a held key when the ledge ends.
+                chordTime *= clear;
+                chordEnd = arcAt(chordTime);
+                contact.surface = Surface::Wall;
+                contact.normal = Direction({-vx, -vy, 0.0f});
+                keyHeld = false;
+            }
         }
         else if (chordEnd.z < launch.minZ)
         {
@@ -463,11 +596,79 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
                 return finish(chordEnd, chordTime, Outcome::Void);
         }
 
+        // A slope met by the box's edge, steeper than the box's pyramid, slides the body before its feet are down; with
+        // no floor in reach under the body it is the side of something, as a wall is.
+        float const aboveFloor = floor > NO_HEIGHT ? chordEnd.z - floor - launch.landingOffset : NO_HEIGHT;
+        if (contact.surface == Surface::Slope)
+        {
+            if (floor > NO_HEIGHT && aboveFloor <= standing.height)
+            {
+                slope = contact.normal;
+                touchesSlope = true;
+                contact = {};
+            }
+            else
+            {
+                contact.surface = Surface::Wall;
+                contact.normal = Direction(Flat(contact.normal));
+            }
+        }
+
         position = chordEnd;
         segmentTime += chordTime;
         vz = capped ? -terminal : vz - GRAVITY * chordTime;
 
-        if (contact.surface != Surface::None || reachesTerminal || reachesApex)
+        // Pinned against a wall or wedged in a valley, the body stops falling, as the client stops it.
+        auto pinned = [&]()
+        {
+            closeSegment();
+            trajectory.outcome = Outcome::Landed;
+            trajectory.landing = {position.x, position.y, floorAt(position) + launch.landingOffset};
+            return trajectory;
+        };
+
+        // A slide follows its floor's slope until the floor levels out or falls away, as past an edge.
+        if (sliding && !touchesSlope)
+        {
+            if (floor <= NO_HEIGHT || aboveFloor > standing.height)
+                leavesSlope = true;
+            else if (aboveFloor > SLIDE_TOLERANCE)
+                hovering = true;
+            else if (steepFloor({chordEnd.x, chordEnd.y, floor}, slope))
+            {
+                hovering = false;
+                if (!slideDown(slope))
+                    return pinned();
+            }
+            else
+                return finish({chordEnd.x, chordEnd.y, floor + launch.landingOffset}, 0.0f, Outcome::Landed);
+        }
+
+        bool const startsSlide = touchesSlope && !sliding;
+        bool const slideFlush = sliding && segmentTime >= Seconds(SLIDE_SEGMENT_MS);
+        if (touchesSlope)
+        {
+            // A slope facing back the way the slide came is the far side of a valley: the body is wedged there.
+            if (sliding && Dot(Flat(slope), slide) < 0.0f)
+                return pinned();
+
+            stalls = chordTime > 0.0f ? 0 : stalls + 1;
+            turned = turned || startsSlide;
+            sliding = true;
+            hovering = false;
+            if (!slideDown(slope) || stalls >= MAX_STALLS)
+                return pinned();
+        }
+        else if (leavesSlope)
+        {
+            sliding = false;
+            hovering = false;
+            slideWall = {};
+            body = standing;
+        }
+
+        if (contact.surface != Surface::None || reachesTerminal || reachesApex || startsSlide || leavesSlope ||
+            slideFlush)
         {
             closeSegment();
             if (contact.surface == Surface::Wall)
@@ -481,6 +682,13 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
                 }
 
                 stalls = chordTime > 0.0f ? 0 : stalls + 1;
+                if (sliding)
+                {
+                    slideWall = contact.normal;
+                    if (!slideDown(slopeNormal) || stalls >= MAX_STALLS)
+                        return pinned();
+                }
+
                 if (stalls >= MAX_STALLS || vx * vx + vy * vy <= EPSILON)
                 {
                     vx = 0.0f;
@@ -491,8 +699,10 @@ Trajectory Sweep(Launch const& launch, CollisionProbe const& probe)
             }
             else if (contact.surface == Surface::Ceiling)
                 vz = std::min(vz, 0.0f);
-            else
-                vz = reachesTerminal ? -terminal : 0.0f;
+            else if (reachesTerminal)
+                vz = -terminal;
+            else if (reachesApex)
+                vz = 0.0f;
 
             openSegment();
         }

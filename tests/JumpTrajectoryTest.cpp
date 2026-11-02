@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <random>
 #include <utility>
 
 #include "JumpTrajectory.h"
@@ -20,9 +21,10 @@ constexpr float RUN_SPEED = 7.0f;
 constexpr float RADIUS = DEFAULT_COLLISION_RADIUS;
 constexpr uint32 RAYS_PER_CHORD = 5;  // along the body's four leading edges and through its front
 
-// Terrain from a height function, plus optional flat platforms, wall planes, boxes, a ceiling plane and a liquid
-// surface. Platforms are found only within the search distance, like VMAP floors; terrain is found from anywhere above
-// it, like the heightmap. Rays meet planes and boxes but not terrain or platforms, as in the core.
+// Terrain from a height function, plus optional flat platforms, wall planes, boxes, sloped model floors, a ceiling
+// plane and a liquid surface. Platforms and slopes are found only within the search distance, like VMAP floors; terrain
+// is found from anywhere above it, like the heightmap. Rays meet planes, boxes and slopes but not terrain or platforms,
+// as in the core.
 struct FakeWorld : CollisionProbe
 {
     struct Platform
@@ -46,6 +48,7 @@ struct FakeWorld : CollisionProbe
     std::vector<Platform> platforms;
     std::vector<Plane> planes;
     std::vector<Box> boxes;
+    std::vector<Plane> slopes;
     float wallX = 1e9f;
     float ceilingZ = 1e9f;
     float liquidZ = NO_HEIGHT;
@@ -101,13 +104,14 @@ struct FakeWorld : CollisionProbe
             best = (wallX - from.x) / (to.x - from.x);
         if ((from.z - ceilingZ) * (to.z - ceilingZ) < 0.0f)
             best = std::min(best, (ceilingZ - from.z) / (to.z - from.z));
-        for (Plane const& plane : planes)
-        {
-            float const a = Along(plane, from);
-            float const b = Along(plane, to);
-            if (a * b < 0.0f)
-                best = std::min(best, a / (a - b));
-        }
+        for (std::vector<Plane> const* list : {&planes, &slopes})
+            for (Plane const& plane : *list)
+            {
+                float const a = Along(plane, from);
+                float const b = Along(plane, to);
+                if (a * b < 0.0f)
+                    best = std::min(best, a / (a - b));
+            }
         for (Box const& box : boxes)
             best = std::min(best, BoxHit(box, from, to));
         if (best > 1.0f)
@@ -128,6 +132,12 @@ struct FakeWorld : CollisionProbe
         for (Platform const& platform : platforms)
             if (x >= platform.minX && x <= platform.maxX && platform.z <= zFrom && zFrom - platform.z <= maxSearch)
                 best = std::max(best, platform.z);
+        for (Plane const& slope : slopes)
+        {
+            float const z = (slope.offset - slope.normal.x * x - slope.normal.y * y) / slope.normal.z;
+            if (z <= zFrom && zFrom - z <= maxSearch)
+                best = std::max(best, z);
+        }
         return best;
     }
 
@@ -147,6 +157,37 @@ Launch RunningJump(Point from)
     launch.velocity.x = RUN_SPEED;
     launch.velocity.z = JUMP_VELOCITY;
     return launch;
+}
+
+Launch Fall(Point from)
+{
+    Launch launch;
+    launch.position = from;
+    return launch;
+}
+
+// Terrain rising this steeply toward -x from flat ground at x = 5.
+std::function<float(float, float)> SlopeFromFive(float gradient)
+{
+    return [gradient](float x, float) { return std::max(0.0f, gradient * (5.0f - x)); };
+}
+
+// Every point of the segments that start and end on the terrain stays near it: a slide keeps to its slope.
+void ExpectSlideKeepsToTheTerrain(Trajectory const& trajectory, FakeWorld const& world)
+{
+    auto clearance = [&](Point const& point) { return point.z - world.terrain(point.x, point.y); };
+    uint32 onSlope = 0;
+    for (Segment const& segment : trajectory.segments)
+    {
+        if (clearance(segment.start) > 0.25f || clearance(segment.end) > 0.25f)
+            continue;
+
+        ++onSlope;
+        for (uint32 ms = 0; ms <= segment.durationMs; ms += 10)
+            EXPECT_NEAR(clearance(PositionAt(segment, ms)), 0.0f, 0.25f);
+    }
+
+    EXPECT_GE(onSlope, 1u);
 }
 
 uint32 TotalMs(Trajectory const& trajectory)
@@ -720,6 +761,236 @@ TEST(JumpTrajectory, LaunchAgainstAWallStaysOnItsSide)
 
     ASSERT_EQ(trajectory.outcome, Outcome::Landed);
     EXPECT_LT(trajectory.landing.x, 0.2f);
+}
+
+// Too steep to stand on: the client lets the body fall freely and pushes it out sideways along the slope.
+TEST(JumpTrajectory, SteepSlopeSlidesToItsFoot)
+{
+    FakeWorld world;
+    world.terrain = SlopeFromFive(2.0f);  // 63 degrees
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 20.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_GT(trajectory.landing.x, 4.8f);
+    EXPECT_LT(trajectory.landing.x, 5.4f);
+    EXPECT_NEAR(trajectory.landing.z, 0.0f, 0.001f);
+    EXPECT_NEAR(TotalMs(trajectory), std::sqrt(2.0f * 20.0f / GRAVITY) * 1000.0f, 50.0f);
+    ExpectSlideKeepsToTheTerrain(trajectory, world);
+}
+
+// Chords merge into segments, a few per second, that each keep to the slope.
+TEST(JumpTrajectory, LongSlideKeepsToTheSlope)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return std::max(0.0f, 2.0f * (25.0f - x)); };
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 60.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_NEAR(trajectory.landing.x, 25.0f, 0.3f);
+    ExpectSlideKeepsToTheTerrain(trajectory, world);
+    EXPECT_LE(trajectory.segments.size(), TotalMs(trajectory) / 200u + 3u);
+}
+
+// Off a slope that steepens the body lifts clear and falls back onto it, still within the slide's segments.
+TEST(JumpTrajectory, SteepeningSlopeSlidesInFewSegments)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return x < 5.0f ? 30.0f - x * x : 5.0f; };
+    Trajectory trajectory = Sweep(Fall({1.0f, 0.0f, 35.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_NEAR(trajectory.landing.x, 5.0f, 0.3f);
+    EXPECT_LE(trajectory.segments.size(), TotalMs(trajectory) / 200u + 3u);
+}
+
+TEST(JumpTrajectory, SlopeJustUnderTheLimitIsStoodOn)
+{
+    FakeWorld world;
+    world.terrain = SlopeFromFive(std::tan(48.0f * 3.14159265f / 180.0f));
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 20.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_FLOAT_EQ(trajectory.landing.x, 2.0f);
+}
+
+TEST(JumpTrajectory, SlopeJustOverTheLimitSlides)
+{
+    FakeWorld world;
+    world.terrain = SlopeFromFive(std::tan(52.0f * 3.14159265f / 180.0f));
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 20.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_GT(trajectory.landing.x, 4.5f);
+}
+
+// The floor beside a ledge's edge is far below: the body stands on the edge.
+TEST(JumpTrajectory, LedgeEdgeIsStoodOn)
+{
+    FakeWorld world;
+    world.platforms.push_back({-10.0f, 1.0f, 5.0f});
+    Trajectory trajectory = Sweep(Fall({0.95f, 0.0f, 8.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_FLOAT_EQ(trajectory.landing.x, 0.95f);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 5.0f);
+}
+
+// Below a step's nose the next step is in reach, but the step it lands on is flat.
+TEST(JumpTrajectory, StepNoseIsStoodOn)
+{
+    FakeWorld world;
+    world.platforms.push_back({-10.0f, 1.0f, 0.4f});
+    Trajectory trajectory = Sweep(Fall({0.95f, 0.0f, 5.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_FLOAT_EQ(trajectory.landing.x, 0.95f);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 0.4f);
+}
+
+// No floor beside it on either side tells nothing of its slope: the body stands on it.
+TEST(JumpTrajectory, NarrowPostIsStoodOn)
+{
+    FakeWorld world;
+    world.platforms.push_back({0.9f, 1.0f, 5.0f});
+    Trajectory trajectory = Sweep(Fall({0.95f, 0.0f, 8.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 5.0f);
+}
+
+// Slid to the bottom of a steep valley, the body is wedged between its sides and stops there.
+TEST(JumpTrajectory, SteepValleyWedgesTheSlide)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return 3.0f * std::abs(x); };
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 20.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(std::abs(trajectory.landing.x), 0.3f);
+    EXPECT_NEAR(trajectory.landing.z, world.terrain(trajectory.landing.x, 0.0f), 0.01f);
+}
+
+// One side gentle enough to slide down, the other a cliff: the body is wedged where they meet.
+TEST(JumpTrajectory, ValleyUnderACliffWedgesTheSlide)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return x > 0.0f ? 1.5f * x : -6.0f * x; };
+    Trajectory trajectory = Sweep(Fall({1.5f, 0.0f, 10.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(std::abs(trajectory.landing.x), 0.3f);
+}
+
+// The heightmap's cliff rises above where the floor is searched from: the slide still stops at it.
+TEST(JumpTrajectory, SlideIntoATerrainCliffStopsAtIt)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return x > 0.0f ? 2.0f * x : -50.0f * x; };
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 10.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_GT(trajectory.landing.x, -0.05f);
+    EXPECT_LT(trajectory.landing.x, 0.3f);
+}
+
+// A jump up a steep hillside comes back down it: the slope takes the motion into it, as a wall does.
+TEST(JumpTrajectory, JumpUpASteepHillSlidesBack)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return std::max(0.0f, 1.43f * (x - 3.0f)); };  // 55 degrees
+    Trajectory trajectory = Sweep(RunningJump({0.0f, 0.0f, 0.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_LT(trajectory.landing.x, 3.1f);
+    EXPECT_NEAR(trajectory.landing.z, world.terrain(trajectory.landing.x, 0.0f), 0.001f);
+    for (size_t i = 1; i < trajectory.segments.size(); ++i)
+        EXPECT_LE(trajectory.segments[i].end.z, trajectory.segments[i].start.z);
+}
+
+TEST(JumpTrajectory, SlopeIntoAWallPinsTheBody)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return 2.0f * x; };
+    world.wallX = 1.0f;
+    Trajectory trajectory = Sweep(Fall({3.0f, 0.0f, 20.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_GT(trajectory.landing.x, 1.0f + RADIUS);
+    EXPECT_LT(trajectory.landing.x, 1.0f + RADIUS + 2.0f * CONTACT_GAP);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, 2.0f * trajectory.landing.x);
+}
+
+// Past the slope's foot the floor falls away. The push was not speed, so the body drops straight down from there.
+TEST(JumpTrajectory, SlideOffAnEdgeFallsStraightDown)
+{
+    FakeWorld world;
+    world.terrain = [](float x, float) { return x < 5.0f ? 2.0f * (5.0f - x) : -20.0f; };
+    Trajectory trajectory = Sweep(Fall({2.0f, 0.0f, 20.0f}), world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_FLOAT_EQ(trajectory.landing.z, -20.0f);
+    EXPECT_GT(trajectory.landing.x, 5.0f);
+    EXPECT_LT(trajectory.landing.x, 5.5f);
+    Segment const& last = trajectory.segments.back();
+    EXPECT_FLOAT_EQ(last.end.x, last.start.x);
+    EXPECT_GT(last.start.z, -1.0f);
+    EXPECT_NEAR(TotalMs(trajectory), std::sqrt(2.0f * 40.0f / GRAVITY) * 1000.0f, 50.0f);
+}
+
+// Across a steep model slope the body keeps its speed along it. Its box rides above the slope, so its rays do not meet
+// the slope at every chord.
+TEST(JumpTrajectory, RunAcrossASteepModelSlope)
+{
+    FakeWorld world;
+    float const gradient = 2.75f;  // 70 degrees
+    float const length = std::sqrt(gradient * gradient + 1.0f);
+    world.slopes.push_back({{gradient / length, 0.0f, 1.0f / length}, 5.0f * gradient / length});  // z = 2.75 (5 - x)
+    Launch launch = Fall({2.0f, 0.0f, 20.0f});
+    launch.velocity.y = RUN_SPEED;
+    Trajectory trajectory = Sweep(launch, world);
+
+    ASSERT_EQ(trajectory.outcome, Outcome::Landed);
+    EXPECT_GT(trajectory.landing.x, 4.8f);
+    EXPECT_NEAR(trajectory.landing.y, RUN_SPEED * TotalMs(trajectory) / 1000.0f, 0.05f);
+    EXPECT_LT(world.rays, 180u);
+}
+
+// Jumps, knockbacks and falls over random hills, many too steep to stand on, all come down on the ground.
+TEST(JumpTrajectory, RandomHillsAlwaysLandOnTheGround)
+{
+    std::mt19937 random(1);
+    std::uniform_real_distribution<float> unit(0.0f, 1.0f);
+    for (uint32 i = 0; i < 2000; ++i)
+    {
+        float const heightX = unit(random) * 6.0f;
+        float const frequencyX = 0.2f + unit(random) * 1.5f;
+        float const phaseX = unit(random) * 6.0f;
+        float const heightY = unit(random) * 6.0f;
+        float const frequencyY = 0.2f + unit(random) * 1.5f;
+        float const phaseY = unit(random) * 6.0f;
+        float const ridge = unit(random) * 3.0f;
+        float const ridgeFrequency = 0.3f + unit(random) * 0.7f;
+        FakeWorld world;
+        world.terrain = [=](float x, float y)
+        {
+            return heightX * std::sin(frequencyX * x + phaseX) + heightY * std::sin(frequencyY * y + phaseY) +
+                   ridge * std::abs(std::sin(ridgeFrequency * (x + y)));
+        };
+
+        Launch launch;
+        launch.position = {unit(random) * 10.0f, unit(random) * 10.0f, 0.0f};
+        launch.position.z = world.terrain(launch.position.x, launch.position.y) + unit(random) * 40.0f;
+        float const heading = unit(random) * 6.2831853f;
+        float const speed = unit(random) < 0.3f ? 0.0f : unit(random) * 25.0f;
+        launch.velocity = {speed * std::cos(heading), speed * std::sin(heading), unit(random) * 20.0f - 5.0f};
+        launch.moveKeyHeld = unit(random) < 0.5f;
+        Trajectory const trajectory = Sweep(launch, world);
+
+        ASSERT_EQ(trajectory.outcome, Outcome::Landed) << "launch " << i;
+        ASSERT_NEAR(trajectory.landing.z, world.terrain(trajectory.landing.x, trajectory.landing.y), 0.05f)
+            << "launch " << i;
+        ASSERT_LE(trajectory.segments.size(), TotalMs(trajectory) / 100u + 6u) << "launch " << i;
+    }
 }
 
 TEST(JumpTrajectorySegment, AmplitudeAndVelocityMatchTheSplineMath)
